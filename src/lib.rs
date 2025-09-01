@@ -3,19 +3,26 @@ use bevy::prelude::*;
 use bevy::render::{mesh::*, render_asset::RenderAssetUsages, render_resource::*};
 use std::hash::Hash;
 
+use bevy::{
+    asset::WaitForAssetError,
+    tasks::{block_on, poll_once, IoTaskPool, Task},
+};
+
 pub mod prelude;
 
 pub struct Sprite3dPlugin;
 impl Plugin for Sprite3dPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Sprite3dCaches>();
-        app.add_systems(
-            PostUpdate,
-            (
-                bundle_builder,
-                (handle_texture_atlases, handle_images).after(bundle_builder),
-            ),
-        );
+        app.init_resource::<Sprite3dCaches>()
+            .init_resource::<WaitingSprites>()
+            .add_systems(
+                PostUpdate,
+                (
+                    finalize_waiting_sprites,
+                    bundle_builder.after(finalize_waiting_sprites),
+                    (handle_texture_atlases, handle_images).after(bundle_builder),
+                ),
+            );
     }
 }
 
@@ -69,6 +76,10 @@ pub struct Sprite3dCaches {
     pub material_cache: HashMap<MatKey, MeshMaterial3d<StandardMaterial>>,
 }
 
+// resource holding tasks for entities waiting on assets
+#[derive(Resource, Default)]
+struct WaitingSprites(Vec<(Entity, Task<Result<(), WaitForAssetError>>)>);
+
 fn bundle_builder(
     mut commands: Commands,
     images: Res<Assets<Image>>,
@@ -76,6 +87,8 @@ fn bundle_builder(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+    asset_server: Res<AssetServer>,
+    mut waiting: ResMut<WaitingSprites>,
     mut query: Query<
         (
             &mut Sprite3d,
@@ -88,6 +101,32 @@ fn bundle_builder(
     >,
 ) {
     for (mut sprite3d, mut mesh, mut mat, sprite, e) in query.iter_mut() {
+        // check readiness
+        let image_ready = images.get(&sprite.image).is_some();
+        let (atlas_ready, layout_handle) = if let Some(atlas) = &sprite.texture_atlas {
+            (
+                atlas_layouts.get(&atlas.layout).is_some(),
+                Some(atlas.layout.clone()),
+            )
+        } else {
+            (true, None)
+        };
+
+        if !(image_ready && atlas_ready) {
+            let image_h = sprite.image.clone();
+            let layout_h = layout_handle;
+            let server = asset_server.clone();
+            let task = IoTaskPool::get().spawn(async move {
+                server.wait_for_asset(&image_h).await?;
+                if let Some(l) = layout_h {
+                    server.wait_for_asset(&l).await?;
+                }
+                Ok(())
+            });
+            waiting.0.push((e, task));
+            continue; // defer building until assets loaded
+        }
+
         // get image dimensions
         let image_size = images.get(&sprite.image).unwrap().texture_descriptor.size;
         // w & h are the world-space size of the sprite.
@@ -223,6 +262,166 @@ fn bundle_builder(
 
         commands.entity(e).remove::<Sprite3dBuilder>();
     }
+}
+
+// finalize deferred sprites once their tasks complete.
+fn finalize_waiting_sprites(
+    mut commands: Commands,
+    images: Res<Assets<Image>>,
+    mut caches: ResMut<Sprite3dCaches>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+    mut waiting: ResMut<WaitingSprites>,
+    mut query: Query<
+        (
+            &mut Sprite3d,
+            &mut Mesh3d,
+            &mut MeshMaterial3d<StandardMaterial>,
+            &Sprite,
+            Entity,
+        ),
+        With<Sprite3dBuilder>,
+    >,
+) {
+    let mut still_waiting = Vec::new();
+    for (entity, task) in waiting.0.drain(..) {
+        if !task.is_finished() {
+            still_waiting.push((entity, task));
+            continue;
+        }
+        match block_on(poll_once(task)) {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                warn!("Sprite3d asset load failed: {e}");
+                continue;
+            }
+            None => continue,
+        }
+
+        if let Ok((mut sprite3d, mut mesh, mut mat, sprite, e)) = query.get_mut(entity) {
+            // Re-run construction body (assets guaranteed ready now).
+            let image_size = if let Some(img) = images.get(&sprite.image) {
+                img.texture_descriptor.size
+            } else {
+                continue;
+            };
+            let w = (image_size.width as f32) / sprite3d.pixels_per_metre;
+            let h = (image_size.height as f32) / sprite3d.pixels_per_metre;
+            let pivot = sprite3d.pivot.unwrap_or(Vec2::new(0.5, 0.5));
+
+            if let Some(atlas) = &sprite.texture_atlas {
+                if let Some(atlas_layout) = atlas_layouts.get(&atlas.layout) {
+                    for rect in &atlas_layout.textures {
+                        let w = rect.width() as f32 / sprite3d.pixels_per_metre;
+                        let h = rect.height() as f32 / sprite3d.pixels_per_metre;
+                        let frac_rect = bevy::math::Rect {
+                            min: Vec2::new(
+                                rect.min.x as f32 / (image_size.width as f32),
+                                rect.min.y as f32 / (image_size.height as f32),
+                            ),
+                            max: Vec2::new(
+                                rect.max.x as f32 / (image_size.width as f32),
+                                rect.max.y as f32 / (image_size.height as f32),
+                            ),
+                        };
+                        let mut rect_pivot = pivot;
+                        rect_pivot.x *= frac_rect.width();
+                        rect_pivot.y *= frac_rect.height();
+                        rect_pivot += frac_rect.min;
+                        let mesh_key = [
+                            (w * MESH_CACHE_GRANULARITY) as u32,
+                            (h * MESH_CACHE_GRANULARITY) as u32,
+                            (rect_pivot.x * MESH_CACHE_GRANULARITY) as u32,
+                            (rect_pivot.y * MESH_CACHE_GRANULARITY) as u32,
+                            sprite3d.double_sided as u32,
+                            (frac_rect.min.x * MESH_CACHE_GRANULARITY) as u32,
+                            (frac_rect.min.y * MESH_CACHE_GRANULARITY) as u32,
+                            (frac_rect.max.x * MESH_CACHE_GRANULARITY) as u32,
+                            (frac_rect.max.y * MESH_CACHE_GRANULARITY) as u32,
+                        ];
+                        sprite3d.texture_atlas_keys.push(mesh_key);
+                        if !caches.mesh_cache.contains_key(&mesh_key) {
+                            let mut m = quad(w, h, Some(pivot), sprite3d.double_sided);
+                            m.insert_attribute(
+                                Mesh::ATTRIBUTE_UV_0,
+                                vec![
+                                    [frac_rect.min.x, frac_rect.max.y],
+                                    [frac_rect.max.x, frac_rect.max.y],
+                                    [frac_rect.min.x, frac_rect.min.y],
+                                    [frac_rect.max.x, frac_rect.min.y],
+                                    [frac_rect.min.x, frac_rect.max.y],
+                                    [frac_rect.max.x, frac_rect.max.y],
+                                    [frac_rect.min.x, frac_rect.min.y],
+                                    [frac_rect.max.x, frac_rect.min.y],
+                                ],
+                            );
+                            let mesh_h = Mesh3d(meshes.add(m));
+                            caches.mesh_cache.insert(mesh_key, mesh_h);
+                        }
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                let mesh_key = [
+                    (w * MESH_CACHE_GRANULARITY) as u32,
+                    (h * MESH_CACHE_GRANULARITY) as u32,
+                    (pivot.x * MESH_CACHE_GRANULARITY) as u32,
+                    (pivot.y * MESH_CACHE_GRANULARITY) as u32,
+                    sprite3d.double_sided as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                sprite3d.texture_atlas_keys.push(mesh_key);
+            }
+
+            *mesh = {
+                let mesh_key = if let Some(atlas) = &sprite.texture_atlas {
+                    sprite3d.texture_atlas_keys[atlas.index]
+                } else {
+                    *sprite3d.texture_atlas_keys.first().unwrap()
+                };
+                if let Some(m) = caches.mesh_cache.get(&mesh_key) {
+                    m.clone()
+                } else {
+                    let m = Mesh3d(meshes.add(quad(w, h, sprite3d.pivot, sprite3d.double_sided)));
+                    caches.mesh_cache.insert(mesh_key, m.clone());
+                    m
+                }
+            };
+
+            *mat = {
+                let mat_key = MatKey {
+                    image: sprite.image.clone(),
+                    alpha_mode: HashableAlphaMode(sprite3d.alpha_mode),
+                    unlit: sprite3d.unlit,
+                    emissive: reduce_colour(sprite3d.emissive),
+                    flip_x: sprite.flip_x,
+                    flip_y: sprite.flip_y,
+                };
+                if let Some(material) = caches.material_cache.get(&mat_key) {
+                    material.clone()
+                } else {
+                    let material = MeshMaterial3d(materials.add(build_material(
+                        sprite.image.clone(),
+                        sprite3d.alpha_mode,
+                        sprite3d.unlit,
+                        sprite3d.emissive,
+                        sprite.flip_x,
+                        sprite.flip_y,
+                    )));
+                    caches.material_cache.insert(mat_key, material.clone());
+                    material
+                }
+            };
+
+            commands.entity(e).remove::<Sprite3dBuilder>();
+        }
+    }
+    waiting.0 = still_waiting;
 }
 
 // Update the mesh when sprite image change
