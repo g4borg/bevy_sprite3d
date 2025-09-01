@@ -1,3 +1,5 @@
+use bevy::ecs::component::HookContext;
+use bevy::ecs::world::DeferredWorld;
 use bevy::platform::collections::hash_map::HashMap;
 use bevy::prelude::*;
 use bevy::render::{mesh::*, render_asset::RenderAssetUsages, render_resource::*};
@@ -35,6 +37,7 @@ pub struct MatKey {
     alpha_mode: HashableAlphaMode,
     unlit: bool,
     emissive: [u8; 4],
+    base_color: [u8; 4],
     flip_x: bool,
     flip_y: bool,
 }
@@ -70,6 +73,12 @@ fn reduce_colour(c: LinearRgba) -> [u8; 4] {
     ]
 }
 
+fn reduce_color_from_bevy(c: Color) -> [u8; 4] {
+    // Convert to linear first for consistent reduction
+    let lin = c.to_linear();
+    reduce_colour(lin)
+}
+
 #[derive(Resource, Default)]
 pub struct Sprite3dCaches {
     pub mesh_cache: HashMap<[u32; 9], Mesh3d>,
@@ -80,6 +89,10 @@ pub struct Sprite3dCaches {
 #[derive(Resource, Default)]
 struct WaitingSprites(Vec<(Entity, Task<Result<(), WaitForAssetError>>)>);
 
+// Marker: user supplied a material BEFORE Sprite3d inserted, so we preserve most fields and skip caching.
+#[derive(Component)]
+struct Sprite3dUserMaterial;
+
 fn bundle_builder(
     mut commands: Commands,
     images: Res<Assets<Image>>,
@@ -89,6 +102,7 @@ fn bundle_builder(
     atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     asset_server: Res<AssetServer>,
     mut waiting: ResMut<WaitingSprites>,
+    user_materials: Query<(), With<Sprite3dUserMaterial>>,
     mut query: Query<
         (
             &mut Sprite3d,
@@ -100,6 +114,7 @@ fn bundle_builder(
         With<Sprite3dBuilder>,
     >,
 ) {
+    // Entities without a Sprite won't match the query; once Sprite is added they will.
     for (mut sprite3d, mut mesh, mut mat, sprite, e) in query.iter_mut() {
         // check readiness
         let image_ready = images.get(&sprite.image).is_some();
@@ -177,7 +192,9 @@ fn bundle_builder(
                     (frac_rect.max.y * MESH_CACHE_GRANULARITY) as u32,
                 ];
 
-                sprite3d.texture_atlas_keys.push(mesh_key);
+                if sprite3d.texture_atlas_keys.last().copied() != Some(mesh_key) {
+                    sprite3d.texture_atlas_keys.push(mesh_key);
+                }
 
                 // if we don't have a mesh in the cache, create it.
                 if !caches.mesh_cache.contains_key(&mesh_key) {
@@ -212,7 +229,9 @@ fn bundle_builder(
                 0,
                 0,
             ];
-            sprite3d.texture_atlas_keys.push(mesh_key);
+            if sprite3d.texture_atlas_keys.last().copied() != Some(mesh_key) {
+                sprite3d.texture_atlas_keys.push(mesh_key);
+            }
         }
 
         *mesh = {
@@ -235,30 +254,56 @@ fn bundle_builder(
 
         // likewise for material, use the existing if the image is already cached.
         // (possibly look into a bool in Sprite3dBuilder to manually disable caching for an individual sprite?)
-        *mat = {
+        // Material handling (hybrid): if user supplied a material prior to Sprite3d, preserve & modify minimal fields (skip caching).
+        if user_materials.get(e).is_ok() {
+            if let Some(existing) = materials.get_mut(&mat.0) {
+                // Always enforce the sprite's texture (library controls texture).
+                existing.base_color_texture = Some(sprite.image.clone());
+                if sprite3d.alpha_mode != DEFAULT_ALPHA_MODE {
+                    existing.alpha_mode = sprite3d.alpha_mode;
+                }
+                if sprite3d.unlit {
+                    existing.unlit = true;
+                }
+                if sprite3d.emissive != LinearRgba::BLACK {
+                    existing.emissive = sprite3d.emissive;
+                }
+                if sprite.flip_x || sprite.flip_y {
+                    existing.flip(sprite.flip_x, sprite.flip_y);
+                }
+                // Preserve existing.base_color (user tint / colour authority).
+            }
+        } else {
+            // Cached / new material path; base_color taken from Sprite.color for tint.
+            let base_colour_arr = reduce_color_from_bevy(sprite.color);
             let mat_key = MatKey {
                 image: sprite.image.clone(),
                 alpha_mode: HashableAlphaMode(sprite3d.alpha_mode),
                 unlit: sprite3d.unlit,
                 emissive: reduce_colour(sprite3d.emissive),
+                base_color: base_colour_arr,
                 flip_x: sprite.flip_x,
                 flip_y: sprite.flip_y,
             };
-            if let Some(material) = caches.material_cache.get(&mat_key) {
+            *mat = if let Some(material) = caches.material_cache.get(&mat_key) {
                 material.clone()
             } else {
-                let material = MeshMaterial3d(materials.add(build_material(
+                let mut new_mat = build_material(
                     sprite.image.clone(),
                     sprite3d.alpha_mode,
                     sprite3d.unlit,
                     sprite3d.emissive,
                     sprite.flip_x,
                     sprite.flip_y,
-                )));
-                caches.material_cache.insert(mat_key, material.clone());
-                material
-            }
-        };
+                );
+                // apply tint
+                // Convert back to linear colour from reduced representation? We still have sprite.color.
+                new_mat.base_color = sprite.color;
+                let handle = MeshMaterial3d(materials.add(new_mat));
+                caches.material_cache.insert(mat_key, handle.clone());
+                handle
+            };
+        }
 
         commands.entity(e).remove::<Sprite3dBuilder>();
     }
@@ -273,6 +318,7 @@ fn finalize_waiting_sprites(
     mut materials: ResMut<Assets<StandardMaterial>>,
     atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut waiting: ResMut<WaitingSprites>,
+    user_materials: Query<(), With<Sprite3dUserMaterial>>,
     mut query: Query<
         (
             &mut Sprite3d,
@@ -393,30 +439,50 @@ fn finalize_waiting_sprites(
                 }
             };
 
-            *mat = {
+            if user_materials.get(e).is_ok() {
+                if let Some(existing) = materials.get_mut(&mat.0) {
+                    existing.base_color_texture = Some(sprite.image.clone());
+                    if sprite3d.alpha_mode != DEFAULT_ALPHA_MODE {
+                        existing.alpha_mode = sprite3d.alpha_mode;
+                    }
+                    if sprite3d.unlit {
+                        existing.unlit = true;
+                    }
+                    if sprite3d.emissive != LinearRgba::BLACK {
+                        existing.emissive = sprite3d.emissive;
+                    }
+                    if sprite.flip_x || sprite.flip_y {
+                        existing.flip(sprite.flip_x, sprite.flip_y);
+                    }
+                }
+            } else {
+                let base_colour_arr = reduce_color_from_bevy(sprite.color);
                 let mat_key = MatKey {
                     image: sprite.image.clone(),
                     alpha_mode: HashableAlphaMode(sprite3d.alpha_mode),
                     unlit: sprite3d.unlit,
                     emissive: reduce_colour(sprite3d.emissive),
+                    base_color: base_colour_arr,
                     flip_x: sprite.flip_x,
                     flip_y: sprite.flip_y,
                 };
-                if let Some(material) = caches.material_cache.get(&mat_key) {
+                *mat = if let Some(material) = caches.material_cache.get(&mat_key) {
                     material.clone()
                 } else {
-                    let material = MeshMaterial3d(materials.add(build_material(
+                    let mut new_mat = build_material(
                         sprite.image.clone(),
                         sprite3d.alpha_mode,
                         sprite3d.unlit,
                         sprite3d.emissive,
                         sprite.flip_x,
                         sprite.flip_y,
-                    )));
-                    caches.material_cache.insert(mat_key, material.clone());
-                    material
-                }
-            };
+                    );
+                    new_mat.base_color = sprite.color;
+                    let handle = MeshMaterial3d(materials.add(new_mat));
+                    caches.material_cache.insert(mat_key, handle.clone());
+                    handle
+                };
+            }
 
             commands.entity(e).remove::<Sprite3dBuilder>();
         }
@@ -424,34 +490,71 @@ fn finalize_waiting_sprites(
     waiting.0 = still_waiting;
 }
 
-// Update the mesh when sprite image change
+// Update the mesh when sprite image or atlas region changes
 fn handle_images(
     mut caches: ResMut<Sprite3dCaches>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut query: Query<(&mut MeshMaterial3d<StandardMaterial>, &Sprite, &Sprite3d), Changed<Sprite>>,
+    mut query: Query<
+        (
+            Entity,
+            &mut MeshMaterial3d<StandardMaterial>,
+            &Sprite,
+            &Sprite3d,
+            Option<&Sprite3dUserMaterial>,
+        ),
+        Changed<Sprite>,
+    >,
 ) {
-    for (mut mesh_mat, sprite, sprite_3d) in query.iter_mut() {
+    for (entity, mut mesh_mat, sprite, sprite_3d, user_flag) in query.iter_mut() {
+        if user_flag.is_some() {
+            // Update only the controlled fields on the user's material; don't swap handle.
+            if let Some(existing) = materials.get_mut(&mesh_mat.0) {
+                existing.base_color_texture = Some(sprite.image.clone());
+                if sprite_3d.alpha_mode != DEFAULT_ALPHA_MODE {
+                    existing.alpha_mode = sprite_3d.alpha_mode;
+                }
+                if sprite_3d.unlit {
+                    existing.unlit = true;
+                }
+                if sprite_3d.emissive != LinearRgba::BLACK {
+                    existing.emissive = sprite_3d.emissive;
+                }
+                if sprite.flip_x || sprite.flip_y {
+                    existing.flip(sprite.flip_x, sprite.flip_y);
+                }
+            } else {
+                warn!(
+                    "Sprite3d: user material asset for entity {:?} missing when updating image",
+                    entity
+                );
+            }
+            continue;
+        }
+
         let mat_key = MatKey {
             image: sprite.image.clone(),
             alpha_mode: HashableAlphaMode(sprite_3d.alpha_mode),
             unlit: sprite_3d.unlit,
             emissive: reduce_colour(sprite_3d.emissive),
+            base_color: reduce_color_from_bevy(sprite.color),
             flip_x: sprite.flip_x,
             flip_y: sprite.flip_y,
         };
         let mat = if let Some(material) = caches.material_cache.get(&mat_key) {
             material.clone()
         } else {
-            let material = MeshMaterial3d(materials.add(build_material(
+            let mut base = build_material(
                 sprite.image.clone(),
                 sprite_3d.alpha_mode,
                 sprite_3d.unlit,
                 sprite_3d.emissive,
                 sprite.flip_x,
                 sprite.flip_y,
-            )));
-            caches.material_cache.insert(mat_key, material.clone());
-            material
+            );
+            base.base_color = sprite.color; // apply tint for new material path
+            let material_h = MeshMaterial3d(materials.add(base));
+            caches.material_cache.insert(mat_key, material_h.clone());
+            material_h
         };
 
         if *mesh_mat != mat {
@@ -477,7 +580,6 @@ fn handle_texture_atlases(
         }
     }
 }
-
 // creates a (potentially offset) quad mesh facing +z
 // pivot = None will have a center pivot
 // pivot = Some(p) will have an expected range of p \in (0,0) to (1,1)
@@ -592,7 +694,8 @@ struct Sprite3dBuilder;
 /// `texture_atlas` and `texture_atlas_keys` on an already spawned sprite may
 /// cause buggy behavior.
 #[derive(Component)]
-#[require(Transform, Mesh3d, MeshMaterial3d<StandardMaterial>, Sprite3dBuilder)]
+#[require(Transform, Mesh3d, Sprite3dBuilder)]
+#[component(on_insert = sprite3d_on_insert)]
 pub struct Sprite3d {
     pub texture_atlas_keys: Vec<[u32; 9]>,
 
@@ -627,6 +730,27 @@ pub struct Sprite3d {
     /// `true` (default) adds a second set of indices, describing the same tris
     /// in reverse order.
     pub double_sided: bool,
+}
+
+// On-insert hook to detect user-provided material & handle missing Sprite component scenario.
+fn sprite3d_on_insert(mut world: DeferredWorld, ctx: HookContext) {
+    let entity = ctx.entity;
+    if world
+        .get::<MeshMaterial3d<StandardMaterial>>(entity)
+        .is_some()
+    {
+        // User supplied a material before Sprite3d.
+        world.commands().entity(entity).insert(Sprite3dUserMaterial);
+    } else {
+        // Insert a default placeholder material (texture & other fields set later).
+        let handle = world
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        world
+            .commands()
+            .entity(entity)
+            .insert(MeshMaterial3d(handle));
+    }
 }
 
 impl Default for Sprite3d {
