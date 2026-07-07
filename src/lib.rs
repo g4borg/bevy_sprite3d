@@ -241,7 +241,7 @@ fn bundle_builder(mut commands: Commands,
 
         // Material handling: if user supplied a material prior to Sprite3d, preserve & modify minimal fields.
         if user_materials.get(e).is_ok() {
-            if let Some(existing) = materials.get_mut(&mat.0) {
+            if let Some(mut existing) = materials.get_mut(&mat.0) {
                 existing.base_color_texture = Some(sprite.image.clone());
                 if sprite3d.alpha_mode != DEFAULT_ALPHA_MODE {
                     existing.alpha_mode = sprite3d.alpha_mode;
@@ -391,7 +391,7 @@ fn finalize_waiting_sprites(
         };
 
         if user_materials.get(e).is_ok() {
-            if let Some(existing) = materials.get_mut(&mat.0) {
+            if let Some(mut existing) = materials.get_mut(&mat.0) {
                 existing.base_color_texture = Some(sprite.image.clone());
                 if sprite3d.alpha_mode != DEFAULT_ALPHA_MODE {
                     existing.alpha_mode = sprite3d.alpha_mode;
@@ -446,7 +446,7 @@ fn handle_images(
 {
     for (entity, mut mesh_mat, sprite, sprite_3d, user_flag) in query.iter_mut() {
         if user_flag.is_some() {
-            if let Some(existing) = materials.get_mut(&mesh_mat.0) {
+            if let Some(mut existing) = materials.get_mut(&mesh_mat.0) {
                 existing.base_color_texture = Some(sprite.image.clone());
                 if sprite_3d.alpha_mode != DEFAULT_ALPHA_MODE {
                     existing.alpha_mode = sprite_3d.alpha_mode;

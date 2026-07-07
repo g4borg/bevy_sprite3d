@@ -2,7 +2,6 @@ use bevy::anti_alias::taa::TemporalAntiAliasing;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::pbr::ScreenSpaceAmbientOcclusion;
 use bevy::post_process::bloom::Bloom;
-use bevy::render::view::Hdr;
 use bevy::{prelude::*, window::WindowResolution};
 use std::time::Duration;
 
@@ -113,7 +112,6 @@ fn setup(mut commands: Commands,
             clear_color: ClearColorConfig::Custom(Color::NONE),
             ..default()
         })
-        .insert(Hdr)
         .insert(Msaa::Off)
         .insert(Bloom {
             intensity: 0.3,
@@ -417,7 +415,7 @@ fn spawn_sprites(mut commands: Commands, images: Res<ImageAssets>)
         PointLight {
             intensity: 500_000.0,
             color: Color::srgb(1.0, 231./255., 221./255.),
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(2.0, 1.8, -5.5),
@@ -448,7 +446,7 @@ fn spawn_sprites(mut commands: Commands, images: Res<ImageAssets>)
         PointLight {
             intensity: 70_000.0,
             color: Color::srgb(91./255., 1.0, 92./255.),
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(-5., 1.1, 6.5),
